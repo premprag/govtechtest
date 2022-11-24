@@ -1,0 +1,217 @@
+provider "azurerm" {
+  subscription_id = "${ var.azure_subscription_id }"
+  client_id       = "${ var.azure_client_id }"
+  client_secret   = "${ var.azure_client_secret }"
+  tenant_id       = "${ var.azure_tenant_id }"
+}
+
+resource "azurerm_resource_group" "rg_prem_hello" {
+    name = "rg_prem_hello"
+    location = "West US"
+}
+
+resource "azurerm_virtual_network" "net_prem_hello" {
+    name = "premvn"
+    address_space = ["10.0.0.0/16"]
+    location = "West US"
+    resource_group_name = "${azurerm_resource_group.rg_prem_hello.name}"
+}
+
+resource "azurerm_log_analytics_workspace" "insights" {
+  name                = "logs-${random_pet.primary.id}"
+  location            = azurerm_resource_group.primary.location
+  resource_group_name = azurerm_resource_group.primary.name
+  retention_in_days   = 30
+}
+
+resource "azurerm_subnet" "prem_hello_subnet" {
+    name = "premsub"
+    resource_group_name = "${azurerm_resource_group.rg_prem_hello.name}"
+    virtual_network_name = "${azurerm_virtual_network.net_prem_hello.name}"
+    address_prefix = "10.0.2.0/24"
+}
+
+#create azure_virtual_machine" "vm-windows" {
+  count                         = "${(((var.vm_os_id != "" && var.is_windows_image == "true") || contains(list("${var.vm_os_simple}","${var.vm_os_offer}"), "WindowsServer")) && var.data_disk == "false") ? var.nb_instances : 0}"
+  name                          = "${var.vm_hostname}${count.index}"
+  location                      = "${var.location}"
+  resource_group_name           = "${azurerm_resource_group.vm.name}"
+  availability_set_id           = "${azurerm_availability_set.vm.id}"
+  vm_size                       = "${var.vm_size}"
+  network_interface_ids         = ["${element(azurerm_network_interface.vm.*.id, count.index)}"]
+  delete_os_disk_on_termination = "${var.delete_os_disk_on_termination}"
+
+  storage_image_reference {
+    id        = "${var.vm_os_id}"
+    publisher = "${var.vm_os_id == "" ? coalesce(var.vm_os_publisher, module.os.calculated_value_os_publisher) : ""}"
+    offer     = "${var.vm_os_id == "" ? coalesce(var.vm_os_offer, module.os.calculated_value_os_offer) : ""}"
+    sku       = "${var.vm_os_id == "" ? coalesce(var.vm_os_sku, module.os.calculated_value_os_sku) : ""}"
+    version   = "${var.vm_os_id == "" ? var.vm_os_version : ""}"
+  }
+
+  storage_os_disk {
+    name              = "osdisk-${var.vm_hostname}-${count.index}"
+    create_option     = "FromImage"
+    caching           = "ReadWrite"
+    managed_disk_type = "${var.storage_account_type}"
+  }
+
+  os_profile {
+    computer_name  = "${var.vm_hostname}${count.index}"
+    admin_username = "${var.admin_username}"
+    admin_password = "${var.admin_password}"
+  }
+
+  tags = "${var.tags}"
+
+  os_profile_windows_config {}
+
+  boot_diagnostics {
+    enabled     = "${var.boot_diagnostics}"
+    storage_uri = "${var.boot_diagnostics == "true" ? join(",", azurerm_storage_account.vm-sa.*.primary_blob_endpoint) : "" }"
+  }
+}
+
+resource "azurerm_network_interface" "prem_hello_nic" {
+    name = "premni"
+    location = "West US"
+    resource_group_name = "${azurerm_resource_group.rg_prem_hello.name}"
+
+    ip_configuration {
+        name = "cfg1"
+        subnet_id = "${azurerm_subnet.prem_hello_subnet.id}"
+        private_ip_address_allocation = "static"
+        private_ip_address = "10.0.2.5"
+        public_ip_address_id = "${azurerm_public_ip.prem_hello_ips.id}"
+    }
+}
+
+resource "azurerm_storage_account" "premdemo" {
+    name = "premdemo10101"
+    resource_group_name = "${azurerm_resource_group.rg_paul_hello.name}"
+    location = "west us"
+    account_type = "Standard_LRS"
+
+    tags {
+        environment = "staging"
+    }
+}
+
+# create storage container
+resource "azurerm_storage_container" "prem_demo_container" {
+    name = "vhd"
+    resource_group_name = "${azurerm_resource_group.rg_prem_hello.name}"
+    storage_account_name = "${azurerm_storage_account.pauldemo.name}"
+    container_access_type = "private"
+    depends_on = ["azurerm_storage_account.premdemo"]
+}
+
+# create virtual machine
+resource "azurerm_virtual_machine" "prem_hello_vm" {
+    name = "hello_vm"
+    location = "West US"
+    resource_group_name = "${azurerm_resource_group.rg_paul_hello.name}"
+    network_interface_ids = ["${azurerm_network_interface.paul_hello_nic.id}"]
+    vm_size = "Standard_A0"
+
+    storage_image_reference {
+        publisher = "Canonical"
+        offer = "UbuntuServer"
+        sku = "14.04.2-LTS"
+        version = "latest"
+    }
+
+    storage_os_disk {
+        name = "myosdisk"
+        vhd_uri = "${azurerm_storage_account.premdemo.primary_blob_endpoint}${azurerm_storage_container.prem_demo_container.name}/myosdisk.vhd"
+        caching = "ReadWrite"
+        create_option = "FromImage"
+    }
+
+    os_profile {
+        computer_name = "hello"
+        admin_username = "prem"
+        admin_password = "${ var.os_admin_password }"
+    }
+
+    os_profile_linux_config {
+        disable_password_authentication = false
+    }
+
+    tags {
+        environment = "staging"
+    }
+}
+
+# create kubernetes cluster
+resource "azurerm_kubernetes_cluster" "aks" {
+  dns_prefix          = local.aks_cluster_name
+  location            = azurerm_resource_group.primary.location
+  name                = local.aks_cluster_name
+  resource_group_name = rg_prem_hello
+
+  default_node_pool {
+    name       = "system"
+    node_count = 1
+    vm_size    = "Standard_DS2_v2"
+  }
+
+  identity { type = "SystemAssigned" }
+}
+
+default_node_pool {
+  availability_zones   = [1, 2, 3]
+  enable_auto_scaling  = true
+  max_count            = 3
+  min_count            = 1
+  name                 = local.aks_cluster_name
+  orchestrator_version = data.azurerm_kubernetes_service_versions.current.latest_version
+  os_disk_size_gb      = 1024
+  vm_size              = "Standard_DS2_v2"
+}
+
+# create application-gateway 
+  source                    = "aztfm/application-gateway/azurerm"
+  version                   = "1.0.0"
+  name                      = "application-gateway"
+  resource_group_name       = azurerm_resource_group.rg.name
+  location                  = azurerm_resource_group.rg.location
+  sku                       = { tier = "WAF_v2", size = "WAF_v2", capacity = 2 }
+  subnet_id                 = azurerm_subnet.subnet.id
+  frontend_ip_configuration = { public_ip_address_id = azurerm_public_ip.pip.id, private_ip_address = "10.0.0.10", private_ip_address_allocation = "Static" }
+  backend_address_pools = [
+    { name = "backend-address-pool-1" },
+    { name = "backend-address-pool-2", ip_addresses = "10.0.0.4,10.0.0.5,10.0.0.6" }
+  ]
+  http_listeners        = [{ name = "http-listener", frontend_ip_configuration = "Public", port = 80, protocol = "http" }]
+  backend_http_settings = [{ name = "backend-http-setting", port = 80, protocol = "http", request_timeout = 20 }]
+  request_routing_rules = [
+    {
+      name                       = "request-routing-rule-1"
+      http_listener_name         = "http-listener"
+      backend_address_pool_name  = "backend-address-pool-1"
+      backend_http_settings_name = "backend-http-setting"
+    },
+    {
+      name                       = "request-routing-rule-2"
+      http_listener_name         = "http-listener"
+      backend_address_pool_name  = "backend-address-pool-2"
+      backend_http_settings_name = "backend-http-setting"
+    }
+  ]
+}
+
+# create RBAC
+
+role_based_access_control {
+  enabled = true
+  azure_active_directory {
+    managed                = true
+    admin_group_object_ids = [azuread_group.aks_administrators.object_id]
+  }
+}
+
+resource "azuread_group" "aks_administrators" {
+  name        = "${local.aks_cluster_name}-administrators"
+  description = "Kubernetes administrators for the ${local.aks_cluster_name} cluster."
+}
